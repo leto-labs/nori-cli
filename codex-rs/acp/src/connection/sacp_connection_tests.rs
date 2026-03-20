@@ -245,6 +245,135 @@ async fn test_model_state_after_session_creation() {
     );
 }
 
+/// Test that initial session config options are captured from `session/new`.
+#[tokio::test]
+#[serial]
+async fn test_create_session_captures_initial_config_options() {
+    let Some(config) = mock_agent_config() else {
+        return;
+    };
+    let temp_dir = tempdir().expect("temp dir");
+
+    let conn = SacpConnection::spawn(&config, temp_dir.path())
+        .await
+        .expect("spawn");
+
+    conn.create_session(temp_dir.path(), vec![])
+        .await
+        .expect("create session");
+
+    let config_options = conn.config_options();
+    assert!(
+        config_options
+            .iter()
+            .any(|option| option.id.to_string() == "model"),
+        "expected model config option in initial session config"
+    );
+    assert!(
+        config_options
+            .iter()
+            .any(|option| option.id.to_string() == "thought_level"),
+        "expected thought_level config option in initial session config"
+    );
+}
+
+/// Test that `session/set_config_option` replaces the connection snapshot with
+/// the response-provided config option list.
+#[tokio::test]
+#[serial]
+async fn test_set_config_option_replaces_connection_state() {
+    let Some(config) = mock_agent_config() else {
+        return;
+    };
+    let temp_dir = tempdir().expect("temp dir");
+
+    let conn = SacpConnection::spawn(&config, temp_dir.path())
+        .await
+        .expect("spawn");
+
+    let session_id = conn
+        .create_session(temp_dir.path(), vec![])
+        .await
+        .expect("create session");
+
+    conn.set_config_option(
+        &session_id,
+        &acp::SessionConfigId::from("model".to_string()),
+        &acp::SessionConfigValueId::from("mock-model-fast".to_string()),
+    )
+    .await
+    .expect("set config option");
+
+    let config_options = conn.config_options();
+    assert!(
+        config_options
+            .iter()
+            .any(|option| option.id.to_string() == "speed"),
+        "expected speed config option after switching to fast model"
+    );
+    assert!(
+        !config_options
+            .iter()
+            .any(|option| option.id.to_string() == "thought_level"),
+        "thought_level should be removed when fast model is selected"
+    );
+}
+
+/// Test that `ConfigOptionUpdate` notifications replace the connection-side
+/// snapshot without depending on the reducer path.
+#[tokio::test]
+#[serial]
+async fn test_config_option_update_replaces_connection_state() {
+    let Some(mut config) = mock_agent_config() else {
+        return;
+    };
+    config.env.insert(
+        "MOCK_AGENT_SEND_CONFIG_UPDATE".to_string(),
+        "1".to_string(),
+    );
+    let temp_dir = tempdir().expect("temp dir");
+
+    let mut conn = SacpConnection::spawn(&config, temp_dir.path())
+        .await
+        .expect("spawn");
+    let mut event_rx = conn.take_event_receiver();
+
+    let session_id = conn
+        .create_session(temp_dir.path(), vec![])
+        .await
+        .expect("create session");
+
+    conn.prompt(
+        session_id,
+        vec![acp::ContentBlock::Text(acp::TextContent::new("update config"))],
+    )
+    .await
+    .expect("prompt");
+
+    let mut saw_config_update = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if matches!(
+            event,
+            ConnectionEvent::SessionUpdate(acp::SessionUpdate::ConfigOptionUpdate(_))
+        ) {
+            saw_config_update = true;
+        }
+    }
+
+    assert!(saw_config_update, "expected ConfigOptionUpdate event from mock agent");
+    assert!(
+        conn.config_options()
+            .iter()
+            .any(|option| option.id.to_string() == "thought_level"
+                && matches!(
+                    &option.kind,
+                    acp::SessionConfigKind::Select(select)
+                        if select.current_value.to_string() == "high"
+                )),
+        "expected connection snapshot to track the updated thought_level value"
+    );
+}
+
 /// Test that approval requests flow through the ordered event inbox and the
 /// prompt completes after the approval response is sent back.
 #[tokio::test]

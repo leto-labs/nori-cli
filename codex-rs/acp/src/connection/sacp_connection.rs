@@ -64,6 +64,10 @@ pub struct SacpConnection {
     /// Thread-safe model state, updated on session creation and model switch.
     model_state: std::sync::Arc<std::sync::RwLock<AcpModelState>>,
 
+    /// Thread-safe session config snapshot, updated on session creation/load,
+    /// explicit config changes, and `ConfigOptionUpdate` notifications.
+    session_config_options: std::sync::Arc<std::sync::RwLock<Vec<acp::SessionConfigOption>>>,
+
     /// Handle to the background task driving the SACP connection.
     connection_task: tokio::task::JoinHandle<()>,
 
@@ -155,6 +159,10 @@ impl SacpConnection {
         let approval_cwd = cwd.to_path_buf();
         let write_cwd = cwd.to_path_buf();
         let read_cwd = cwd.to_path_buf();
+        let session_config_options =
+            std::sync::Arc::new(std::sync::RwLock::new(Vec::<acp::SessionConfigOption>::new()));
+        let session_config_options_for_notifications =
+            std::sync::Arc::clone(&session_config_options);
 
         // Oneshot to receive the connection context and init result from inside connect_with.
         let (init_tx, init_rx) =
@@ -168,11 +176,19 @@ impl SacpConnection {
                 .on_receive_notification(
                     {
                         let event_tx = event_tx_for_notifications;
+                        let session_config_options =
+                            std::sync::Arc::clone(&session_config_options_for_notifications);
                         async move |notification: acp::SessionNotification, _connection| {
+                            if let acp::SessionUpdate::ConfigOptionUpdate(update) =
+                                &notification.update
+                                && let Ok(mut state) = session_config_options.write()
+                            {
+                                *state = update.config_options.clone();
+                            }
                             if event_tx
                                 .send(ConnectionEvent::SessionUpdate(notification.update))
                                 .await
-                                .is_err()
+                            .is_err()
                             {
                                 warn!("Notification channel closed, dropping update");
                             }
@@ -454,6 +470,7 @@ impl SacpConnection {
             agent_capabilities: capabilities,
             event_rx,
             model_state: std::sync::Arc::new(std::sync::RwLock::new(AcpModelState::new())),
+            session_config_options,
             connection_task,
             child,
             stderr_task,
@@ -488,6 +505,10 @@ impl SacpConnection {
             );
         }
 
+        if let Ok(mut state) = self.session_config_options.write() {
+            *state = response.config_options.clone().unwrap_or_default();
+        }
+
         Ok(response.session_id)
     }
 
@@ -509,6 +530,10 @@ impl SacpConnection {
             && let Ok(mut state) = self.model_state.write()
         {
             *state = AcpModelState::from_session_model_state(models);
+        }
+
+        if let Ok(mut state) = self.session_config_options.write() {
+            *state = response.config_options.clone().unwrap_or_default();
         }
 
         // The session ID from the request is reused since the response
@@ -561,6 +586,18 @@ impl SacpConnection {
             .clone()
     }
 
+    /// Get the current ACP session config snapshot.
+    pub fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+        #[expect(
+            clippy::expect_used,
+            reason = "RwLock poisoning indicates a bug elsewhere"
+        )]
+        self.session_config_options
+            .read()
+            .expect("Session config state lock poisoned")
+            .clone()
+    }
+
     /// Explicitly tear down the ACP subprocess and background tasks.
     ///
     /// Unlike `Drop`, this async path can wait for process termination so the
@@ -603,6 +640,31 @@ impl SacpConnection {
                 "Model state updated after switch: current={:?}",
                 state.current_model_id
             );
+        }
+
+        Ok(())
+    }
+
+    /// Set the value of a session config option.
+    pub async fn set_config_option(
+        &self,
+        session_id: &acp::SessionId,
+        config_id: &acp::SessionConfigId,
+        value: &acp::SessionConfigValueId,
+    ) -> Result<()> {
+        let response = self
+            .cx
+            .send_request(acp::SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                config_id.clone(),
+                value.clone(),
+            ))
+            .block_task()
+            .await
+            .context("Failed to set ACP session config option")?;
+
+        if let Ok(mut state) = self.session_config_options.write() {
+            *state = response.config_options.clone();
         }
 
         Ok(())
