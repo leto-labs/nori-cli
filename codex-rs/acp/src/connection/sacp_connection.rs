@@ -5,8 +5,13 @@
 //! `ConnectionTo<Agent>` is `Send + Sync`, allowing direct async usage from the main
 //! tokio runtime without a dedicated thread or `LocalSet`.
 
+use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
+use std::process::Command as StdCommand;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use agent_client_protocol_schema as acp;
 use anyhow::Context;
@@ -39,6 +44,26 @@ use sacp::UntypedMessage;
 
 /// Minimum supported ACP protocol version.
 const MINIMUM_SUPPORTED_VERSION: acp::ProtocolVersion = acp::ProtocolVersion::V1;
+
+struct TerminalState {
+    child: StdMutex<std::process::Child>,
+    output: StdMutex<String>,
+    truncated: StdMutex<bool>,
+    exit_status: StdMutex<Option<acp::TerminalExitStatus>>,
+    output_byte_limit: Option<u64>,
+}
+
+impl TerminalState {
+    fn new(child: std::process::Child, output_byte_limit: Option<u64>) -> Self {
+        Self {
+            child: StdMutex::new(child),
+            output: StdMutex::new(String::new()),
+            truncated: StdMutex::new(false),
+            exit_status: StdMutex::new(None),
+            output_byte_limit,
+        }
+    }
+}
 
 /// A thread-safe connection to an ACP agent subprocess using SACP v11.
 ///
@@ -163,6 +188,14 @@ impl SacpConnection {
             std::sync::Arc::new(std::sync::RwLock::new(Vec::<acp::SessionConfigOption>::new()));
         let session_config_options_for_notifications =
             std::sync::Arc::clone(&session_config_options);
+        let terminals =
+            Arc::new(StdMutex::new(HashMap::<acp::TerminalId, Arc<TerminalState>>::new()));
+        let terminals_for_create = Arc::clone(&terminals);
+        let terminals_for_kill = Arc::clone(&terminals);
+        let terminals_for_release = Arc::clone(&terminals);
+        let terminals_for_output = Arc::clone(&terminals);
+        let terminals_for_wait = Arc::clone(&terminals);
+        let terminal_cwd = cwd.to_path_buf();
 
         // Oneshot to receive the connection context and init result from inside connect_with.
         let (init_tx, init_rx) =
@@ -273,6 +306,82 @@ impl SacpConnection {
                                 Ok(())
                             })?;
 
+                            Ok(())
+                        }
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let terminals = Arc::clone(&terminals_for_create);
+                        let cwd = terminal_cwd.clone();
+                        async move |request: acp::CreateTerminalRequest,
+                                    responder: sacp::Responder<acp::CreateTerminalResponse>,
+                                    _connection: ConnectionTo<Agent>| {
+                            match create_terminal(&request, &cwd, &terminals) {
+                                Ok(response) => responder.respond(response)?,
+                                Err(error) => responder.respond_with_error(error)?,
+                            }
+                            Ok(())
+                        }
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let terminals = Arc::clone(&terminals_for_kill);
+                        async move |request: acp::KillTerminalRequest,
+                                    responder: sacp::Responder<acp::KillTerminalResponse>,
+                                    _connection: ConnectionTo<Agent>| {
+                            match kill_terminal(&request, &terminals) {
+                                Ok(response) => responder.respond(response)?,
+                                Err(error) => responder.respond_with_error(error)?,
+                            }
+                            Ok(())
+                        }
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let terminals = Arc::clone(&terminals_for_release);
+                        async move |request: acp::ReleaseTerminalRequest,
+                                    responder: sacp::Responder<acp::ReleaseTerminalResponse>,
+                                    _connection: ConnectionTo<Agent>| {
+                            match release_terminal(&request, &terminals) {
+                                Ok(response) => responder.respond(response)?,
+                                Err(error) => responder.respond_with_error(error)?,
+                            }
+                            Ok(())
+                        }
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let terminals = Arc::clone(&terminals_for_output);
+                        async move |request: acp::TerminalOutputRequest,
+                                    responder: sacp::Responder<acp::TerminalOutputResponse>,
+                                    _connection: ConnectionTo<Agent>| {
+                            match terminal_output(&request, &terminals) {
+                                Ok(response) => responder.respond(response)?,
+                                Err(error) => responder.respond_with_error(error)?,
+                            }
+                            Ok(())
+                        }
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        let terminals = Arc::clone(&terminals_for_wait);
+                        async move |request: acp::WaitForTerminalExitRequest,
+                                    responder: sacp::Responder<acp::WaitForTerminalExitResponse>,
+                                    _connection: ConnectionTo<Agent>| {
+                            match wait_for_terminal_exit(&request, &terminals) {
+                                Ok(response) => responder.respond(response)?,
+                                Err(error) => responder.respond_with_error(error)?,
+                            }
                             Ok(())
                         }
                     },
@@ -717,4 +826,264 @@ fn kill_child_process_group(child: &mut Child) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+fn create_terminal(
+    request: &acp::CreateTerminalRequest,
+    default_cwd: &Path,
+    terminals: &Arc<StdMutex<HashMap<acp::TerminalId, Arc<TerminalState>>>>,
+) -> std::result::Result<acp::CreateTerminalResponse, sacp::Error> {
+    let mut command = StdCommand::new(&request.command);
+    command
+        .args(&request.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let cwd = request.cwd.clone().unwrap_or_else(|| default_cwd.to_path_buf());
+    command.current_dir(cwd);
+
+    for env in &request.env {
+        command.env(&env.name, &env.value);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| sacp::util::internal_error(error.to_string()))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let terminal_id = acp::TerminalId::from(format!("terminal-{}", uuid::Uuid::new_v4()));
+    let terminal = Arc::new(TerminalState::new(child, request.output_byte_limit));
+
+    if let Some(stdout) = stdout {
+        spawn_terminal_reader(stdout, Arc::clone(&terminal));
+    }
+    if let Some(stderr) = stderr {
+        spawn_terminal_reader(stderr, Arc::clone(&terminal));
+    }
+
+    terminals
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal state lock poisoned"))?
+        .insert(terminal_id.clone(), terminal);
+
+    Ok(acp::CreateTerminalResponse::new(terminal_id))
+}
+
+fn kill_terminal(
+    request: &acp::KillTerminalRequest,
+    terminals: &Arc<StdMutex<HashMap<acp::TerminalId, Arc<TerminalState>>>>,
+) -> std::result::Result<acp::KillTerminalResponse, sacp::Error> {
+    let terminal = terminal_state(terminals, &request.terminal_id)?;
+    let mut child = terminal
+        .child
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal child lock poisoned"))?;
+    child
+        .kill()
+        .map_err(|error| sacp::util::internal_error(error.to_string()))?;
+    let status = child
+        .wait()
+        .map_err(|error| sacp::util::internal_error(error.to_string()))?;
+    drop(child);
+
+    *terminal
+        .exit_status
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal exit-status lock poisoned"))? =
+        Some(to_terminal_exit_status(status));
+
+    Ok(acp::KillTerminalResponse::new())
+}
+
+fn release_terminal(
+    request: &acp::ReleaseTerminalRequest,
+    terminals: &Arc<StdMutex<HashMap<acp::TerminalId, Arc<TerminalState>>>>,
+) -> std::result::Result<acp::ReleaseTerminalResponse, sacp::Error> {
+    let terminal = terminals
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal state lock poisoned"))?
+        .remove(&request.terminal_id)
+        .ok_or_else(|| sacp::Error::resource_not_found(None))?;
+
+    let should_kill = terminal
+        .exit_status
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal exit-status lock poisoned"))?
+        .is_none();
+    if should_kill {
+        let mut child = terminal
+            .child
+            .lock()
+            .map_err(|_| sacp::util::internal_error("terminal child lock poisoned"))?;
+        if child
+            .try_wait()
+            .map_err(|error| sacp::util::internal_error(error.to_string()))?
+            .is_none()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    Ok(acp::ReleaseTerminalResponse::new())
+}
+
+fn terminal_output(
+    request: &acp::TerminalOutputRequest,
+    terminals: &Arc<StdMutex<HashMap<acp::TerminalId, Arc<TerminalState>>>>,
+) -> std::result::Result<acp::TerminalOutputResponse, sacp::Error> {
+    let terminal = terminal_state(terminals, &request.terminal_id)?;
+    refresh_terminal_exit_status(&terminal)?;
+
+    let output = terminal
+        .output
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal output lock poisoned"))?
+        .clone();
+    let truncated = *terminal
+        .truncated
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal truncation lock poisoned"))?;
+    let exit_status = terminal
+        .exit_status
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal exit-status lock poisoned"))?
+        .clone();
+
+    Ok(acp::TerminalOutputResponse::new(output, truncated).exit_status(exit_status))
+}
+
+fn wait_for_terminal_exit(
+    request: &acp::WaitForTerminalExitRequest,
+    terminals: &Arc<StdMutex<HashMap<acp::TerminalId, Arc<TerminalState>>>>,
+) -> std::result::Result<acp::WaitForTerminalExitResponse, sacp::Error> {
+    let terminal = terminal_state(terminals, &request.terminal_id)?;
+
+    if let Some(exit_status) = terminal
+        .exit_status
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal exit-status lock poisoned"))?
+        .clone()
+    {
+        return Ok(acp::WaitForTerminalExitResponse::new(exit_status));
+    }
+
+    let status = terminal
+        .child
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal child lock poisoned"))?
+        .wait()
+        .map_err(|error| sacp::util::internal_error(error.to_string()))?;
+    let exit_status = to_terminal_exit_status(status);
+    *terminal
+        .exit_status
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal exit-status lock poisoned"))? =
+        Some(exit_status.clone());
+
+    Ok(acp::WaitForTerminalExitResponse::new(exit_status))
+}
+
+fn terminal_state(
+    terminals: &Arc<StdMutex<HashMap<acp::TerminalId, Arc<TerminalState>>>>,
+    terminal_id: &acp::TerminalId,
+) -> std::result::Result<Arc<TerminalState>, sacp::Error> {
+    terminals
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal state lock poisoned"))?
+        .get(terminal_id)
+        .cloned()
+        .ok_or_else(|| sacp::Error::resource_not_found(None))
+}
+
+fn spawn_terminal_reader<R>(mut reader: R, terminal: Arc<TerminalState>)
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => append_terminal_output(&terminal, &buf[..read]),
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn append_terminal_output(terminal: &Arc<TerminalState>, bytes: &[u8]) {
+    let chunk = String::from_utf8_lossy(bytes);
+    let mut output = match terminal.output.lock() {
+        Ok(output) => output,
+        Err(_) => return,
+    };
+    output.push_str(&chunk);
+
+    let Some(limit) = terminal.output_byte_limit else {
+        return;
+    };
+
+    if output.len() <= limit as usize {
+        return;
+    }
+
+    let mut truncated = match terminal.truncated.lock() {
+        Ok(truncated) => truncated,
+        Err(_) => return,
+    };
+    *truncated = true;
+
+    while output.len() > limit as usize {
+        let Some(first_char_len) = output.chars().next().map(char::len_utf8) else {
+            break;
+        };
+        output.drain(..first_char_len);
+    }
+}
+
+fn refresh_terminal_exit_status(
+    terminal: &Arc<TerminalState>,
+) -> std::result::Result<(), sacp::Error> {
+    if terminal
+        .exit_status
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal exit-status lock poisoned"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let status = terminal
+        .child
+        .lock()
+        .map_err(|_| sacp::util::internal_error("terminal child lock poisoned"))?
+        .try_wait()
+        .map_err(|error| sacp::util::internal_error(error.to_string()))?;
+
+    if let Some(status) = status {
+        *terminal
+            .exit_status
+            .lock()
+            .map_err(|_| sacp::util::internal_error("terminal exit-status lock poisoned"))? =
+            Some(to_terminal_exit_status(status));
+    }
+
+    Ok(())
+}
+
+fn to_terminal_exit_status(status: std::process::ExitStatus) -> acp::TerminalExitStatus {
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+
+    #[cfg(unix)]
+    let signal = status.signal().map(|signal| signal.to_string());
+    #[cfg(not(unix))]
+    let signal = None;
+
+    acp::TerminalExitStatus::new()
+        .exit_code(status.code().map(|code| code as u32))
+        .signal(signal)
 }

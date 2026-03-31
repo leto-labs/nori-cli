@@ -37,6 +37,14 @@ enum MockClientRequest {
         options: Vec<acp::PermissionOption>,
         responder: oneshot::Sender<Result<acp::RequestPermissionResponse, acp::Error>>,
     },
+    RunTerminalCapture {
+        session_id: acp::SessionId,
+        responder: oneshot::Sender<Result<(String, Option<u32>), acp::Error>>,
+    },
+    RunTerminalKill {
+        session_id: acp::SessionId,
+        responder: oneshot::Sender<Result<bool, acp::Error>>,
+    },
 }
 
 struct MockAgent {
@@ -163,6 +171,34 @@ impl MockAgent {
                 session_id,
                 tool_call,
                 options,
+                responder: tx,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        rx.await.map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn run_terminal_capture_via_client(
+        &self,
+        session_id: acp::SessionId,
+    ) -> Result<(String, Option<u32>), acp::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.client_request_tx
+            .send(MockClientRequest::RunTerminalCapture {
+                session_id,
+                responder: tx,
+            })
+            .map_err(|_| acp::Error::internal_error())?;
+        rx.await.map_err(|_| acp::Error::internal_error())?
+    }
+
+    async fn run_terminal_kill_via_client(
+        &self,
+        session_id: acp::SessionId,
+    ) -> Result<bool, acp::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.client_request_tx
+            .send(MockClientRequest::RunTerminalKill {
+                session_id,
                 responder: tx,
             })
             .map_err(|_| acp::Error::internal_error())?;
@@ -463,6 +499,26 @@ impl acp::Agent for MockAgent {
                 acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(updated)),
             )
             .await?;
+        }
+
+        if std::env::var("MOCK_AGENT_RUN_CLIENT_TERMINAL_CAPTURE").is_ok() {
+            let (output, exit_code) = self.run_terminal_capture_via_client(session_id.clone()).await?;
+            self.send_text_chunk(
+                session_id.clone(),
+                &format!("CLIENT_TERMINAL_OUTPUT:{output}\nCLIENT_TERMINAL_EXIT:{exit_code:?}"),
+            )
+            .await?;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+
+        if std::env::var("MOCK_AGENT_RUN_CLIENT_TERMINAL_KILL").is_ok() {
+            let has_exit_status = self.run_terminal_kill_via_client(session_id.clone()).await?;
+            self.send_text_chunk(
+                session_id.clone(),
+                &format!("CLIENT_TERMINAL_KILLED:{has_exit_status}"),
+            )
+            .await?;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
 
         // Reproduce the orphan tool cell bug caused by cascade deferral.
@@ -1413,6 +1469,81 @@ async fn main() -> acp::Result<()> {
                                         session_id, tool_call, options,
                                     ))
                                     .await;
+                                let _ = responder.send(result);
+                            }
+                            MockClientRequest::RunTerminalCapture {
+                                session_id,
+                                responder,
+                            } => {
+                                let result = async {
+                                    let created = conn
+                                        .create_terminal(
+                                            acp::CreateTerminalRequest::new(session_id.clone(), "sh")
+                                                .args(vec![
+                                                    "-c".to_string(),
+                                                    "printf 'hello from terminal'".to_string(),
+                                                ]),
+                                        )
+                                        .await?;
+                                    let waited = conn
+                                        .wait_for_terminal_exit(acp::WaitForTerminalExitRequest::new(
+                                            session_id.clone(),
+                                            created.terminal_id.clone(),
+                                        ))
+                                        .await?;
+                                    let output = conn
+                                        .terminal_output(acp::TerminalOutputRequest::new(
+                                            session_id.clone(),
+                                            created.terminal_id.clone(),
+                                        ))
+                                        .await?;
+                                    let _ = conn
+                                        .release_terminal(acp::ReleaseTerminalRequest::new(
+                                            session_id,
+                                            created.terminal_id,
+                                        ))
+                                        .await;
+                                    Ok((output.output, waited.exit_status.exit_code))
+                                }
+                                .await;
+                                let _ = responder.send(result);
+                            }
+                            MockClientRequest::RunTerminalKill {
+                                session_id,
+                                responder,
+                            } => {
+                                let result = async {
+                                    let created = conn
+                                        .create_terminal(
+                                            acp::CreateTerminalRequest::new(session_id.clone(), "sh")
+                                                .args(vec![
+                                                    "-c".to_string(),
+                                                    "sleep 5".to_string(),
+                                                ]),
+                                        )
+                                        .await?;
+                                    conn.kill_terminal_command(
+                                        acp::KillTerminalCommandRequest::new(
+                                            session_id.clone(),
+                                            created.terminal_id.clone(),
+                                        ),
+                                    )
+                                    .await?;
+                                    let output = conn
+                                        .terminal_output(acp::TerminalOutputRequest::new(
+                                            session_id.clone(),
+                                            created.terminal_id.clone(),
+                                        ))
+                                        .await?;
+                                    let _ = conn
+                                        .release_terminal(acp::ReleaseTerminalRequest::new(
+                                            session_id,
+                                            created.terminal_id,
+                                        ))
+                                        .await;
+                                    Ok(output.exit_status.is_some())
+                                }
+                                .await;
                                 let _ = responder.send(result);
                             }
                         }

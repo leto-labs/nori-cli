@@ -374,6 +374,104 @@ async fn test_config_option_update_replaces_connection_state() {
     );
 }
 
+#[tokio::test]
+#[serial]
+#[cfg(unix)]
+async fn test_client_terminal_methods_capture_output_and_exit_status() {
+    let Some(mut config) = mock_agent_config() else {
+        return;
+    };
+    config.env.insert(
+        "MOCK_AGENT_RUN_CLIENT_TERMINAL_CAPTURE".to_string(),
+        "1".to_string(),
+    );
+    let temp_dir = tempdir().expect("temp dir");
+
+    let mut conn = SacpConnection::spawn(&config, temp_dir.path())
+        .await
+        .expect("spawn");
+    let mut event_rx = conn.take_event_receiver();
+
+    let session_id = conn
+        .create_session(temp_dir.path(), vec![])
+        .await
+        .expect("create session");
+
+    conn.prompt(
+        session_id,
+        vec![acp::ContentBlock::Text(acp::TextContent::new(
+            "run client terminal capture",
+        ))],
+    )
+    .await
+    .expect("prompt");
+
+    let mut combined = String::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let ConnectionEvent::SessionUpdate(acp::SessionUpdate::AgentMessageChunk(chunk)) = event
+            && let acp::ContentBlock::Text(text) = chunk.content
+        {
+            combined.push_str(&text.text);
+        }
+    }
+
+    assert!(
+        combined.contains("CLIENT_TERMINAL_OUTPUT:hello from terminal"),
+        "expected captured terminal output, got: {combined}"
+    );
+    assert!(
+        combined.contains("CLIENT_TERMINAL_EXIT:Some(0)"),
+        "expected successful terminal exit status, got: {combined}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+#[cfg(unix)]
+async fn test_client_terminal_kill_reports_exit_status() {
+    let Some(mut config) = mock_agent_config() else {
+        return;
+    };
+    config.env.insert(
+        "MOCK_AGENT_RUN_CLIENT_TERMINAL_KILL".to_string(),
+        "1".to_string(),
+    );
+    let temp_dir = tempdir().expect("temp dir");
+
+    let mut conn = SacpConnection::spawn(&config, temp_dir.path())
+        .await
+        .expect("spawn");
+    let mut event_rx = conn.take_event_receiver();
+
+    let session_id = conn
+        .create_session(temp_dir.path(), vec![])
+        .await
+        .expect("create session");
+
+    conn.prompt(
+        session_id,
+        vec![acp::ContentBlock::Text(acp::TextContent::new(
+            "run client terminal kill",
+        ))],
+    )
+    .await
+    .expect("prompt");
+
+    let mut combined = String::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let ConnectionEvent::SessionUpdate(acp::SessionUpdate::AgentMessageChunk(chunk)) = event
+            && let acp::ContentBlock::Text(text) = chunk.content
+        {
+            combined.push_str(&text.text);
+        }
+    }
+
+    assert!(
+        combined.contains("CLIENT_TERMINAL_KILLED:true"),
+        "expected terminal kill flow to report an exit status, got: {combined}"
+    );
+}
+
 /// Test that approval requests flow through the ordered event inbox and the
 /// prompt completes after the approval response is sent back.
 #[tokio::test]
