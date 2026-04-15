@@ -526,6 +526,40 @@ impl ChatWidget {
         self.bottom_pane.show_selection_view(params);
     }
 
+    /// Open the ACP mode picker popup.
+    pub(crate) fn open_mode_popup(&mut self) {
+        if let Some(handle) = self.acp_handle.clone() {
+            let app_event_tx = self.app_event_tx.clone();
+            tokio::spawn(async move {
+                if let Some(mode_state) = handle.get_mode_state().await {
+                    let modes: Vec<crate::app_event::AcpModeInfo> = mode_state
+                        .available_modes
+                        .iter()
+                        .map(|mode| crate::app_event::AcpModeInfo {
+                            mode_id: mode.id.to_string(),
+                            display_name: mode.name.clone(),
+                            description: mode.description.clone(),
+                        })
+                        .collect();
+                    app_event_tx.send(AppEvent::OpenAcpModePicker {
+                        modes,
+                        current_mode_id: Some(mode_state.current_mode_id.to_string()),
+                    });
+                } else {
+                    tracing::warn!("Failed to get ACP mode state");
+                    app_event_tx.send(AppEvent::OpenAcpModePicker {
+                        modes: vec![],
+                        current_mode_id: None,
+                    });
+                }
+            });
+            return;
+        }
+
+        let params = crate::nori::agent_picker::acp_mode_picker_params();
+        self.bottom_pane.show_selection_view(params);
+    }
+
     /// Open the ACP session-config popup.
     pub(crate) fn open_session_config_popup(&mut self) {
         if let Some(handle) = self.acp_handle.clone() {
@@ -551,6 +585,19 @@ impl ChatWidget {
         let params = crate::nori::agent_picker::acp_model_picker_params_with_models(
             &models,
             current_model_id.as_deref(),
+        );
+        self.bottom_pane.show_selection_view(params);
+    }
+
+    /// Open the ACP mode picker with fetched modes.
+    pub(crate) fn open_acp_mode_picker(
+        &mut self,
+        modes: Vec<crate::app_event::AcpModeInfo>,
+        current_mode_id: Option<String>,
+    ) {
+        let params = crate::nori::agent_picker::acp_mode_picker_params_with_modes(
+            &modes,
+            current_mode_id.as_deref(),
         );
         self.bottom_pane.show_selection_view(params);
     }
@@ -606,6 +653,38 @@ impl ChatWidget {
         } else {
             self.add_info_message(
                 "No ACP agent handle available for model switching".to_string(),
+                None,
+            );
+        }
+    }
+
+    /// Set the ACP mode via the agent handle.
+    pub(crate) fn set_acp_mode(&mut self, mode_id: String, display_name: String) {
+        if let Some(handle) = self.acp_handle.clone() {
+            let app_event_tx = self.app_event_tx.clone();
+            let display_name_for_result = display_name.clone();
+            tokio::spawn(async move {
+                match handle.set_mode(mode_id).await {
+                    Ok(()) => {
+                        app_event_tx.send(AppEvent::AcpModeSetResult {
+                            success: true,
+                            display_name: display_name_for_result,
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        app_event_tx.send(AppEvent::AcpModeSetResult {
+                            success: false,
+                            display_name: display_name_for_result,
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            });
+            self.add_info_message(format!("Switching to mode: {display_name}..."), None);
+        } else {
+            self.add_info_message(
+                "No ACP agent handle available for mode switching".to_string(),
                 None,
             );
         }

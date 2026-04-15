@@ -8,6 +8,8 @@ use codex_acp::AcpModelState;
 use codex_acp::HistoryPersistence;
 use codex_acp::SessionConfigId;
 use codex_acp::SessionConfigOption;
+use codex_acp::SessionModeId;
+use codex_acp::SessionModeState;
 use codex_acp::find_nori_home;
 use codex_acp::get_agent_config;
 use codex_acp::get_agent_display_name;
@@ -67,6 +69,15 @@ pub(crate) enum AcpAgentCommand {
         model_id: String,
         response_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    /// Get the current mode state (available modes and current selection).
+    GetModeState {
+        response_tx: oneshot::Sender<Option<SessionModeState>>,
+    },
+    /// Set the active mode.
+    SetMode {
+        mode_id: String,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
     /// Get the current ACP session config snapshot.
     GetSessionConfig {
         response_tx: oneshot::Sender<Vec<SessionConfigOption>>,
@@ -110,6 +121,33 @@ impl AcpAgentHandle {
         self.command_tx
             .send(AcpAgentCommand::SetModel {
                 model_id,
+                response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("ACP agent command channel closed"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("ACP agent did not respond"))?
+    }
+
+    /// Get the current mode state from the ACP agent.
+    pub async fn get_mode_state(&self) -> Option<SessionModeState> {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(AcpAgentCommand::GetModeState { response_tx })
+            .is_err()
+        {
+            return None;
+        }
+        response_rx.await.ok().flatten()
+    }
+
+    /// Set the active mode in the ACP agent.
+    pub async fn set_mode(&self, mode_id: String) -> anyhow::Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(AcpAgentCommand::SetMode {
+                mode_id,
                 response_tx,
             })
             .map_err(|_| anyhow::anyhow!("ACP agent command channel closed"))?;
@@ -365,6 +403,18 @@ fn spawn_acp_agent(
                         let result = backend_for_agent.set_model(&model_id).await;
                         let _ = response_tx.send(result);
                     }
+                    AcpAgentCommand::GetModeState { response_tx } => {
+                        let state = backend_for_agent.mode_state();
+                        let _ = response_tx.send(state);
+                    }
+                    AcpAgentCommand::SetMode {
+                        mode_id,
+                        response_tx,
+                    } => {
+                        let mode_id = SessionModeId::from(mode_id);
+                        let result = backend_for_agent.set_mode(&mode_id).await;
+                        let _ = response_tx.send(result);
+                    }
                     AcpAgentCommand::GetSessionConfig { response_tx } => {
                         let state = backend_for_agent.config_options();
                         let _ = response_tx.send(state);
@@ -554,6 +604,18 @@ pub(crate) fn spawn_acp_agent_resume(
                     } => {
                         let model_id = codex_acp::ModelId::from(model_id);
                         let result = backend_for_agent.set_model(&model_id).await;
+                        let _ = response_tx.send(result);
+                    }
+                    AcpAgentCommand::GetModeState { response_tx } => {
+                        let state = backend_for_agent.mode_state();
+                        let _ = response_tx.send(state);
+                    }
+                    AcpAgentCommand::SetMode {
+                        mode_id,
+                        response_tx,
+                    } => {
+                        let mode_id = SessionModeId::from(mode_id);
+                        let result = backend_for_agent.set_mode(&mode_id).await;
                         let _ = response_tx.send(result);
                     }
                     AcpAgentCommand::GetSessionConfig { response_tx } => {

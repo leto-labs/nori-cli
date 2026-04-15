@@ -201,6 +201,25 @@ impl CommandPopup {
         }
         // When filtering, sort by ascending score and then by name for stability.
         out.sort_by(|a, b| {
+            if let (CommandItem::Builtin(left), CommandItem::Builtin(right)) = (&a.0, &b.0) {
+                let left_command = left.command();
+                let right_command = right.command();
+                if left_command.starts_with(filter) && right_command.starts_with(filter) {
+                    let left_index = self
+                        .builtins
+                        .iter()
+                        .position(|(_, cmd)| cmd == left)
+                        .unwrap_or(usize::MAX);
+                    let right_index = self
+                        .builtins
+                        .iter()
+                        .position(|(_, cmd)| cmd == right)
+                        .unwrap_or(usize::MAX);
+                    if left_index != right_index {
+                        return left_index.cmp(&right_index);
+                    }
+                }
+            }
             a.2.cmp(&b.2).then_with(|| {
                 let an = match a.0 {
                     CommandItem::Builtin(c) => c.command(),

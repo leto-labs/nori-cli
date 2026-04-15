@@ -304,6 +304,11 @@ impl AcpBackend {
         self.connection.model_state()
     }
 
+    /// Get the current ACP session mode state.
+    pub fn mode_state(&self) -> Option<acp::SessionModeState> {
+        self.connection.mode_state()
+    }
+
     /// Get the current ACP session config snapshot.
     pub fn config_options(&self) -> Vec<acp::SessionConfigOption> {
         self.connection.config_options()
@@ -339,6 +344,12 @@ impl AcpBackend {
     pub async fn set_model(&self, model_id: &acp::ModelId) -> Result<()> {
         let session_id = self.session_id.read().await;
         self.connection.set_model(&session_id, model_id).await
+    }
+
+    /// Switch to a different mode for the current session.
+    pub async fn set_mode(&self, mode_id: &acp::SessionModeId) -> Result<()> {
+        let session_id = self.session_id.read().await;
+        self.connection.set_mode(&session_id, mode_id).await
     }
 
     /// Set the value of a session config option for the current session.

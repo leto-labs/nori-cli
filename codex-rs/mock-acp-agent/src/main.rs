@@ -57,6 +57,7 @@ struct MockAgent {
 
 #[derive(Clone)]
 struct MockSessionConfig {
+    mode_id: String,
     model_id: String,
     thought_level: Option<String>,
     speed: Option<String>,
@@ -207,10 +208,23 @@ impl MockAgent {
 
     fn default_session_config() -> MockSessionConfig {
         MockSessionConfig {
+            mode_id: "default".to_string(),
             model_id: "mock-model-default".to_string(),
             thought_level: Some("medium".to_string()),
             speed: None,
         }
+    }
+
+    fn session_mode_state(config: &MockSessionConfig) -> acp::SessionModeState {
+        acp::SessionModeState::new(
+            config.mode_id.clone(),
+            vec![
+                acp::SessionMode::new("default", "Default")
+                    .description("Standard assistant behavior"),
+                acp::SessionMode::new("review", "Review")
+                    .description("Review code and focus on findings"),
+            ],
+        )
     }
 
     fn session_model_state() -> acp::SessionModelState {
@@ -382,6 +396,7 @@ impl acp::Agent for MockAgent {
 
         Ok(
             acp::NewSessionResponse::new(acp::SessionId::new(session_id.to_string()))
+                .modes(Self::session_mode_state(&config))
                 .models(Self::session_model_state())
                 .config_options(Self::config_options_for_state(&config)),
         )
@@ -421,6 +436,7 @@ impl acp::Agent for MockAgent {
         }
 
         Ok(acp::LoadSessionResponse::new()
+            .modes(Self::session_mode_state(&config))
             .models(Self::session_model_state())
             .config_options(Self::config_options_for_state(&config)))
     }
@@ -501,8 +517,26 @@ impl acp::Agent for MockAgent {
             .await?;
         }
 
+        if std::env::var("MOCK_AGENT_SEND_MODE_UPDATE").is_ok() {
+            {
+                let mut sessions = self.session_configs.borrow_mut();
+                let state = sessions
+                    .entry(session_id.to_string())
+                    .or_insert_with(Self::default_session_config);
+                state.mode_id = "review".to_string();
+            }
+
+            self.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new("review")),
+            )
+            .await?;
+        }
+
         if std::env::var("MOCK_AGENT_RUN_CLIENT_TERMINAL_CAPTURE").is_ok() {
-            let (output, exit_code) = self.run_terminal_capture_via_client(session_id.clone()).await?;
+            let (output, exit_code) = self
+                .run_terminal_capture_via_client(session_id.clone())
+                .await?;
             self.send_text_chunk(
                 session_id.clone(),
                 &format!("CLIENT_TERMINAL_OUTPUT:{output}\nCLIENT_TERMINAL_EXIT:{exit_code:?}"),
@@ -512,7 +546,9 @@ impl acp::Agent for MockAgent {
         }
 
         if std::env::var("MOCK_AGENT_RUN_CLIENT_TERMINAL_KILL").is_ok() {
-            let has_exit_status = self.run_terminal_kill_via_client(session_id.clone()).await?;
+            let has_exit_status = self
+                .run_terminal_kill_via_client(session_id.clone())
+                .await?;
             self.send_text_chunk(
                 session_id.clone(),
                 &format!("CLIENT_TERMINAL_KILLED:{has_exit_status}"),
@@ -1328,8 +1364,13 @@ impl acp::Agent for MockAgent {
 
     async fn set_session_mode(
         &self,
-        _args: acp::SetSessionModeRequest,
+        args: acp::SetSessionModeRequest,
     ) -> Result<acp::SetSessionModeResponse, acp::Error> {
+        let mut sessions = self.session_configs.borrow_mut();
+        let state = sessions
+            .entry(args.session_id.to_string())
+            .or_insert_with(Self::default_session_config);
+        state.mode_id = args.mode_id.to_string();
         Ok(acp::SetSessionModeResponse::default())
     }
 
@@ -1475,37 +1516,43 @@ async fn main() -> acp::Result<()> {
                                 session_id,
                                 responder,
                             } => {
-                                let result = async {
-                                    let created = conn
-                                        .create_terminal(
-                                            acp::CreateTerminalRequest::new(session_id.clone(), "sh")
+                                let result =
+                                    async {
+                                        let created = conn
+                                            .create_terminal(
+                                                acp::CreateTerminalRequest::new(
+                                                    session_id.clone(),
+                                                    "sh",
+                                                )
                                                 .args(vec![
                                                     "-c".to_string(),
                                                     "printf 'hello from terminal'".to_string(),
                                                 ]),
-                                        )
-                                        .await?;
-                                    let waited = conn
-                                        .wait_for_terminal_exit(acp::WaitForTerminalExitRequest::new(
-                                            session_id.clone(),
-                                            created.terminal_id.clone(),
-                                        ))
-                                        .await?;
-                                    let output = conn
-                                        .terminal_output(acp::TerminalOutputRequest::new(
-                                            session_id.clone(),
-                                            created.terminal_id.clone(),
-                                        ))
-                                        .await?;
-                                    let _ = conn
-                                        .release_terminal(acp::ReleaseTerminalRequest::new(
-                                            session_id,
-                                            created.terminal_id,
-                                        ))
-                                        .await;
-                                    Ok((output.output, waited.exit_status.exit_code))
-                                }
-                                .await;
+                                            )
+                                            .await?;
+                                        let waited = conn
+                                            .wait_for_terminal_exit(
+                                                acp::WaitForTerminalExitRequest::new(
+                                                    session_id.clone(),
+                                                    created.terminal_id.clone(),
+                                                ),
+                                            )
+                                            .await?;
+                                        let output = conn
+                                            .terminal_output(acp::TerminalOutputRequest::new(
+                                                session_id.clone(),
+                                                created.terminal_id.clone(),
+                                            ))
+                                            .await?;
+                                        let _ = conn
+                                            .release_terminal(acp::ReleaseTerminalRequest::new(
+                                                session_id,
+                                                created.terminal_id,
+                                            ))
+                                            .await;
+                                        Ok((output.output, waited.exit_status.exit_code))
+                                    }
+                                    .await;
                                 let _ = responder.send(result);
                             }
                             MockClientRequest::RunTerminalKill {
@@ -1515,11 +1562,11 @@ async fn main() -> acp::Result<()> {
                                 let result = async {
                                     let created = conn
                                         .create_terminal(
-                                            acp::CreateTerminalRequest::new(session_id.clone(), "sh")
-                                                .args(vec![
-                                                    "-c".to_string(),
-                                                    "sleep 5".to_string(),
-                                                ]),
+                                            acp::CreateTerminalRequest::new(
+                                                session_id.clone(),
+                                                "sh",
+                                            )
+                                            .args(vec!["-c".to_string(), "sleep 5".to_string()]),
                                         )
                                         .await?;
                                     conn.kill_terminal_command(

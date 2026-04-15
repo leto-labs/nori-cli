@@ -682,6 +682,11 @@ pub(crate) fn new_session_info_codex(
             ]),
             Line::from(vec![
                 "  ".into(),
+                "/mode".into(),
+                " - choose what ACP session mode to use".dim(),
+            ]),
+            Line::from(vec![
+                "  ".into(),
                 "/session-config".into(),
                 " - configure ACP session settings exposed by the agent".dim(),
             ]),

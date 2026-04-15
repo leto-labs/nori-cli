@@ -277,6 +277,110 @@ async fn test_create_session_captures_initial_config_options() {
     );
 }
 
+/// Test that initial session modes are captured from `session/new`.
+#[tokio::test]
+#[serial]
+async fn test_create_session_captures_initial_modes() {
+    let Some(config) = mock_agent_config() else {
+        return;
+    };
+    let temp_dir = tempdir().expect("temp dir");
+
+    let conn = SacpConnection::spawn(&config, temp_dir.path())
+        .await
+        .expect("spawn");
+
+    conn.create_session(temp_dir.path(), vec![])
+        .await
+        .expect("create session");
+
+    let mode_state = conn
+        .mode_state()
+        .expect("expected mode state from session/new");
+    assert_eq!(mode_state.current_mode_id.to_string(), "default");
+    assert_eq!(mode_state.available_modes.len(), 2);
+}
+
+/// Test that `session/set_mode` updates the connection-side mode snapshot.
+#[tokio::test]
+#[serial]
+async fn test_set_mode_updates_connection_state() {
+    let Some(config) = mock_agent_config() else {
+        return;
+    };
+    let temp_dir = tempdir().expect("temp dir");
+
+    let conn = SacpConnection::spawn(&config, temp_dir.path())
+        .await
+        .expect("spawn");
+
+    let session_id = conn
+        .create_session(temp_dir.path(), vec![])
+        .await
+        .expect("create session");
+
+    conn.set_mode(&session_id, &acp::SessionModeId::from("review".to_string()))
+        .await
+        .expect("set mode");
+
+    let mode_state = conn
+        .mode_state()
+        .expect("expected mode state after set_mode");
+    assert_eq!(mode_state.current_mode_id.to_string(), "review");
+}
+
+/// Test that `CurrentModeUpdate` notifications replace the connection-side
+/// current mode without depending on the reducer path.
+#[tokio::test]
+#[serial]
+async fn test_current_mode_update_replaces_connection_state() {
+    let Some(mut config) = mock_agent_config() else {
+        return;
+    };
+    config
+        .env
+        .insert("MOCK_AGENT_SEND_MODE_UPDATE".to_string(), "1".to_string());
+    let temp_dir = tempdir().expect("temp dir");
+
+    let mut conn = SacpConnection::spawn(&config, temp_dir.path())
+        .await
+        .expect("spawn");
+    let mut event_rx = conn.take_event_receiver();
+
+    let session_id = conn
+        .create_session(temp_dir.path(), vec![])
+        .await
+        .expect("create session");
+
+    conn.prompt(
+        session_id,
+        vec![acp::ContentBlock::Text(acp::TextContent::new(
+            "update mode",
+        ))],
+    )
+    .await
+    .expect("prompt");
+
+    let mut saw_mode_update = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if matches!(
+            event,
+            ConnectionEvent::SessionUpdate(acp::SessionUpdate::CurrentModeUpdate(_))
+        ) {
+            saw_mode_update = true;
+        }
+    }
+
+    assert!(
+        saw_mode_update,
+        "expected CurrentModeUpdate event from mock agent"
+    );
+    let mode_state = conn
+        .mode_state()
+        .expect("expected mode state after CurrentModeUpdate");
+    assert_eq!(mode_state.current_mode_id.to_string(), "review");
+}
+
 /// Test that `session/set_config_option` replaces the connection snapshot with
 /// the response-provided config option list.
 #[tokio::test]
@@ -327,10 +431,9 @@ async fn test_config_option_update_replaces_connection_state() {
     let Some(mut config) = mock_agent_config() else {
         return;
     };
-    config.env.insert(
-        "MOCK_AGENT_SEND_CONFIG_UPDATE".to_string(),
-        "1".to_string(),
-    );
+    config
+        .env
+        .insert("MOCK_AGENT_SEND_CONFIG_UPDATE".to_string(), "1".to_string());
     let temp_dir = tempdir().expect("temp dir");
 
     let mut conn = SacpConnection::spawn(&config, temp_dir.path())
@@ -345,7 +448,9 @@ async fn test_config_option_update_replaces_connection_state() {
 
     conn.prompt(
         session_id,
-        vec![acp::ContentBlock::Text(acp::TextContent::new("update config"))],
+        vec![acp::ContentBlock::Text(acp::TextContent::new(
+            "update config",
+        ))],
     )
     .await
     .expect("prompt");
@@ -360,7 +465,10 @@ async fn test_config_option_update_replaces_connection_state() {
         }
     }
 
-    assert!(saw_config_update, "expected ConfigOptionUpdate event from mock agent");
+    assert!(
+        saw_config_update,
+        "expected ConfigOptionUpdate event from mock agent"
+    );
     assert!(
         conn.config_options()
             .iter()

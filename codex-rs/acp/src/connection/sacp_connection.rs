@@ -89,6 +89,10 @@ pub struct SacpConnection {
     /// Thread-safe model state, updated on session creation and model switch.
     model_state: std::sync::Arc<std::sync::RwLock<AcpModelState>>,
 
+    /// Thread-safe session mode state, updated on session creation/load,
+    /// explicit mode switches, and `CurrentModeUpdate` notifications.
+    mode_state: std::sync::Arc<std::sync::RwLock<Option<acp::SessionModeState>>>,
+
     /// Thread-safe session config snapshot, updated on session creation/load,
     /// explicit config changes, and `ConfigOptionUpdate` notifications.
     session_config_options: std::sync::Arc<std::sync::RwLock<Vec<acp::SessionConfigOption>>>,
@@ -184,12 +188,16 @@ impl SacpConnection {
         let approval_cwd = cwd.to_path_buf();
         let write_cwd = cwd.to_path_buf();
         let read_cwd = cwd.to_path_buf();
-        let session_config_options =
-            std::sync::Arc::new(std::sync::RwLock::new(Vec::<acp::SessionConfigOption>::new()));
+        let session_config_options = std::sync::Arc::new(std::sync::RwLock::new(Vec::<
+            acp::SessionConfigOption,
+        >::new()));
         let session_config_options_for_notifications =
             std::sync::Arc::clone(&session_config_options);
-        let terminals =
-            Arc::new(StdMutex::new(HashMap::<acp::TerminalId, Arc<TerminalState>>::new()));
+        let mode_state = std::sync::Arc::new(std::sync::RwLock::new(None::<acp::SessionModeState>));
+        let mode_state_for_notifications = std::sync::Arc::clone(&mode_state);
+        let terminals = Arc::new(StdMutex::new(
+            HashMap::<acp::TerminalId, Arc<TerminalState>>::new(),
+        ));
         let terminals_for_create = Arc::clone(&terminals);
         let terminals_for_kill = Arc::clone(&terminals);
         let terminals_for_release = Arc::clone(&terminals);
@@ -211,6 +219,7 @@ impl SacpConnection {
                         let event_tx = event_tx_for_notifications;
                         let session_config_options =
                             std::sync::Arc::clone(&session_config_options_for_notifications);
+                        let mode_state = std::sync::Arc::clone(&mode_state_for_notifications);
                         async move |notification: acp::SessionNotification, _connection| {
                             if let acp::SessionUpdate::ConfigOptionUpdate(update) =
                                 &notification.update
@@ -218,10 +227,26 @@ impl SacpConnection {
                             {
                                 *state = update.config_options.clone();
                             }
+                            if let acp::SessionUpdate::CurrentModeUpdate(update) =
+                                &notification.update
+                                && let Ok(mut state) = mode_state.write()
+                            {
+                                match state.as_mut() {
+                                    Some(mode_state) => {
+                                        mode_state.current_mode_id = update.current_mode_id.clone();
+                                    }
+                                    None => {
+                                        *state = Some(acp::SessionModeState::new(
+                                            update.current_mode_id.clone(),
+                                            vec![],
+                                        ));
+                                    }
+                                }
+                            }
                             if event_tx
                                 .send(ConnectionEvent::SessionUpdate(notification.update))
                                 .await
-                            .is_err()
+                                .is_err()
                             {
                                 warn!("Notification channel closed, dropping update");
                             }
@@ -579,6 +604,7 @@ impl SacpConnection {
             agent_capabilities: capabilities,
             event_rx,
             model_state: std::sync::Arc::new(std::sync::RwLock::new(AcpModelState::new())),
+            mode_state,
             session_config_options,
             connection_task,
             child,
@@ -617,6 +643,9 @@ impl SacpConnection {
         if let Ok(mut state) = self.session_config_options.write() {
             *state = response.config_options.clone().unwrap_or_default();
         }
+        if let Ok(mut state) = self.mode_state.write() {
+            *state = response.modes.clone();
+        }
 
         Ok(response.session_id)
     }
@@ -643,6 +672,9 @@ impl SacpConnection {
 
         if let Ok(mut state) = self.session_config_options.write() {
             *state = response.config_options.clone().unwrap_or_default();
+        }
+        if let Ok(mut state) = self.mode_state.write() {
+            *state = response.modes.clone();
         }
 
         // The session ID from the request is reused since the response
@@ -692,6 +724,18 @@ impl SacpConnection {
         self.model_state
             .read()
             .expect("Model state lock poisoned")
+            .clone()
+    }
+
+    /// Get the current ACP session mode state.
+    pub fn mode_state(&self) -> Option<acp::SessionModeState> {
+        #[expect(
+            clippy::expect_used,
+            reason = "RwLock poisoning indicates a bug elsewhere"
+        )]
+        self.mode_state
+            .read()
+            .expect("Mode state lock poisoned")
             .clone()
     }
 
@@ -749,6 +793,35 @@ impl SacpConnection {
                 "Model state updated after switch: current={:?}",
                 state.current_model_id
             );
+        }
+
+        Ok(())
+    }
+
+    /// Switch to a different mode for the given session.
+    pub async fn set_mode(
+        &self,
+        session_id: &acp::SessionId,
+        mode_id: &acp::SessionModeId,
+    ) -> Result<()> {
+        self.cx
+            .send_request(acp::SetSessionModeRequest::new(
+                session_id.clone(),
+                mode_id.clone(),
+            ))
+            .block_task()
+            .await
+            .context("Failed to set ACP mode")?;
+
+        if let Ok(mut state) = self.mode_state.write() {
+            match state.as_mut() {
+                Some(mode_state) => {
+                    mode_state.current_mode_id = mode_id.clone();
+                }
+                None => {
+                    *state = Some(acp::SessionModeState::new(mode_id.clone(), vec![]));
+                }
+            }
         }
 
         Ok(())
@@ -840,7 +913,10 @@ fn create_terminal(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let cwd = request.cwd.clone().unwrap_or_else(|| default_cwd.to_path_buf());
+    let cwd = request
+        .cwd
+        .clone()
+        .unwrap_or_else(|| default_cwd.to_path_buf());
     command.current_dir(cwd);
 
     for env in &request.env {

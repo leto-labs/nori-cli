@@ -103,6 +103,28 @@ pub fn acp_model_picker_params() -> SelectionViewParams {
     }
 }
 
+/// Create selection view parameters for the ACP mode picker.
+///
+/// This is the fallback when mode state is not available.
+pub fn acp_mode_picker_params() -> SelectionViewParams {
+    let items: Vec<SelectionItem> = vec![SelectionItem {
+        name: "Mode switching not available".to_string(),
+        description: Some("The ACP agent did not provide any session modes".to_string()),
+        is_current: false,
+        actions: vec![],
+        dismiss_on_select: true,
+        ..Default::default()
+    }];
+
+    SelectionViewParams {
+        title: Some("Select Mode".to_string()),
+        subtitle: Some("Mode switching not supported by this agent".to_string()),
+        footer_hint: Some(Line::from("Press esc to dismiss.")),
+        items,
+        ..Default::default()
+    }
+}
+
 /// Create selection view parameters for the ACP model picker with actual models.
 ///
 /// This function creates a picker showing models available from the ACP agent.
@@ -176,6 +198,51 @@ pub fn acp_model_picker_params_with_models(
     }
 }
 
+/// Create selection view parameters for the ACP mode picker with actual modes.
+pub fn acp_mode_picker_params_with_modes(
+    modes: &[crate::app_event::AcpModeInfo],
+    current_mode_id: Option<&str>,
+) -> SelectionViewParams {
+    if modes.is_empty() {
+        return acp_mode_picker_params();
+    }
+
+    let items: Vec<SelectionItem> = modes
+        .iter()
+        .map(|mode| {
+            let is_current = current_mode_id
+                .map(|id| id == mode.mode_id)
+                .unwrap_or(false);
+            let mode_id = mode.mode_id.clone();
+            let display_name = mode.display_name.clone();
+
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                tx.send(AppEvent::SetAcpMode {
+                    mode_id: mode_id.clone(),
+                    display_name: display_name.clone(),
+                });
+            })];
+
+            SelectionItem {
+                name: mode.display_name.clone(),
+                description: mode.description.clone(),
+                is_current,
+                actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    SelectionViewParams {
+        title: Some("Select Mode".to_string()),
+        subtitle: Some("Select a session mode for this ACP agent".to_string()),
+        footer_hint: Some(standard_popup_hint_line()),
+        items,
+        ..Default::default()
+    }
+}
+
 /// Get information about an agent by agent name
 #[allow(dead_code)]
 pub fn get_agent_info(agent_name: &str) -> Option<AcpAgentInfo> {
@@ -215,6 +282,30 @@ mod tests {
         assert!(params.title.is_some());
         assert!(params.subtitle.is_some());
         assert!(params.subtitle.unwrap().contains("Not available"));
+    }
+
+    #[test]
+    fn test_acp_mode_picker_marks_current_mode() {
+        let params = acp_mode_picker_params_with_modes(
+            &[
+                crate::app_event::AcpModeInfo {
+                    mode_id: "default".to_string(),
+                    display_name: "Default".to_string(),
+                    description: Some("Standard assistant behavior".to_string()),
+                },
+                crate::app_event::AcpModeInfo {
+                    mode_id: "review".to_string(),
+                    display_name: "Review".to_string(),
+                    description: Some("Focus on findings".to_string()),
+                },
+            ],
+            Some("review"),
+        );
+
+        assert_eq!(params.title.as_deref(), Some("Select Mode"));
+        assert_eq!(params.items.len(), 2);
+        assert!(!params.items[0].is_current);
+        assert!(params.items[1].is_current);
     }
 
     #[test]
